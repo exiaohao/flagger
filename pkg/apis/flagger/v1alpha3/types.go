@@ -116,6 +116,7 @@ type CanaryAnalysis struct {
 	Webhooks   []CanaryWebhook                  `json:"webhooks,omitempty"`
 	Match      []istiov1alpha3.HTTPMatchRequest `json:"match,omitempty"`
 	Iterations int                              `json:"iterations,omitempty"`
+	IntervalWaits string `json:"intervalWaits,omitempty"`
 }
 
 // CanaryMetric holds the reference to Istio metrics used for canary analysis

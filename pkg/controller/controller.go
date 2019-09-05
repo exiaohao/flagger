@@ -51,6 +51,8 @@ type Controller struct {
 	routerFactory   *router.Factory
 	observerFactory *metrics.Factory
 	meshProvider    string
+	counter 		int
+	stageCounter	int
 }
 
 func NewController(

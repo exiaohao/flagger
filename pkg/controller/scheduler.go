@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +12,18 @@ import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+type ControllerCounter map[string]int
+
+var (
+	CtrlCounter ControllerCounter
+	GlobalCtrlCounter ControllerCounter
+)
+
+func init() {
+	CtrlCounter = make(ControllerCounter)
+	GlobalCtrlCounter = make(ControllerCounter)
+}
+
 // scheduleCanaries synchronises the canary map with the jobs map,
 // for new canaries new jobs are created and started
 // for the removed canaries the jobs are stopped and deleted
@@ -18,9 +31,12 @@ func (c *Controller) scheduleCanaries() {
 	current := make(map[string]string)
 	stats := make(map[string]int)
 
+	c.counter = 0
+	c.stageCounter = 0
+
 	c.canaries.Range(func(key interface{}, value interface{}) bool {
 		canary := value.(*flaggerv1.Canary)
-
+		c.logger.Infof("canary: %+v", canary.Spec.CanaryAnalysis)
 		// format: <name>.<namespace>
 		name := key.(string)
 		current[name] = fmt.Sprintf("%s.%s", canary.Spec.TargetRef.Name, canary.Namespace)
@@ -80,6 +96,7 @@ func (c *Controller) scheduleCanaries() {
 
 func (c *Controller) advanceCanary(name string, namespace string, skipLivenessChecks bool) {
 	begin := time.Now()
+	canaryKey := fmt.Sprintf("%s.%s")
 	// check if the canary exists
 	cd, err := c.flaggerClient.FlaggerV1alpha3().Canaries(namespace).Get(name, v1.GetOptions{})
 	if err != nil {
@@ -87,6 +104,7 @@ func (c *Controller) advanceCanary(name string, namespace string, skipLivenessCh
 			Errorf("Canary %s.%s not found", name, namespace)
 		return
 	}
+	waitIntervals := strings.Split(cd.Spec.CanaryAnalysis.IntervalWaits, ",")
 
 	primaryName := fmt.Sprintf("%s-primary", cd.Spec.TargetRef.Name)
 
@@ -193,6 +211,33 @@ func (c *Controller) advanceCanary(name string, namespace string, skipLivenessCh
 			return
 		}
 		return
+	} else {
+		_, ccok := CtrlCounter[canaryKey]
+		if !ccok {
+			CtrlCounter[canaryKey] = 0
+		}
+		_, gccok := GlobalCtrlCounter[canaryKey]
+		if !gccok {
+			GlobalCtrlCounter[canaryKey] = 0
+		}
+		//
+		//if len(waitIntervals) > GlobalCtrlCounter[canaryKey] {
+		//	if GlobalCtrlCounter[canaryKey] == 0 && CtrlCounter[canaryKey] == 0 {
+		//		c.logger.Info("initial stage canary release!")
+		//		CtrlCounter[canaryKey] += 1
+		//	} else {
+		//		currentStageWaitRounds, _ := strconv.Atoi(waitIntervals[GlobalCtrlCounter[canaryKey]])
+		//		if currentStageWaitRounds > CtrlCounter[canaryKey] {
+		//			c.logger.Infof("=== Wait rounds: %d/%d", CtrlCounter[canaryKey], currentStageWaitRounds)
+		//			CtrlCounter[canaryKey] += 1
+		//			return
+		//		} else {
+		//			c.logger.Info("=== Launch something!")
+		//			CtrlCounter[canaryKey] = 0
+		//			GlobalCtrlCounter[canaryKey] += 1
+		//		}
+		//	}
+		//}
 	}
 
 	defer func() {
@@ -363,7 +408,24 @@ func (c *Controller) advanceCanary(name string, namespace string, skipLivenessCh
 	}
 
 	// canary incremental traffic weight
+	c.logger.Infof("Current CC:%d, GCC:%d", CtrlCounter[canaryKey], GlobalCtrlCounter[canaryKey])
 	if canaryWeight < maxWeight {
+		if len(waitIntervals) > GlobalCtrlCounter[canaryKey] {
+			waitRounds, _ := strconv.Atoi(waitIntervals[GlobalCtrlCounter[canaryKey]])
+			if GlobalCtrlCounter[canaryKey] == 0 && CtrlCounter[canaryKey] == 0 {
+				c.logger.Info("===FIRST TIME, go on!")
+				CtrlCounter[canaryKey] += 1
+			} else if waitRounds > CtrlCounter[canaryKey] {
+				c.logger.Infof("===WAITING %d/%d", CtrlCounter[canaryKey], waitRounds)
+				CtrlCounter[canaryKey] += 1
+				return
+			} else {
+				GlobalCtrlCounter[canaryKey] += 1
+				CtrlCounter[canaryKey] = 0
+			}
+		}
+
+		c.logger.Infof("Current p/c weight = %d/%d", primaryWeight, canaryWeight)
 		primaryWeight -= cd.Spec.CanaryAnalysis.StepWeight
 		if primaryWeight < 0 {
 			primaryWeight = 0
@@ -372,6 +434,7 @@ func (c *Controller) advanceCanary(name string, namespace string, skipLivenessCh
 		if primaryWeight > 100 {
 			primaryWeight = 100
 		}
+		c.logger.Infof("Set p/c weight = %d/%d", primaryWeight, canaryWeight)
 
 		if err := meshRouter.SetRoutes(cd, primaryWeight, canaryWeight); err != nil {
 			c.recordEventWarningf(cd, "%v", err)
@@ -385,7 +448,7 @@ func (c *Controller) advanceCanary(name string, namespace string, skipLivenessCh
 		}
 
 		c.recorder.SetWeight(cd, primaryWeight, canaryWeight)
-		c.recordEventInfof(cd, "Advance %s.%s canary weight %v", cd.Name, cd.Namespace, canaryWeight)
+		c.recordEventInfof(cd, "Advance %s.%s canary weight %v, %s", cd.Name, cd.Namespace, canaryWeight, cd.Spec.CanaryAnalysis.IntervalWaits)
 
 		// promote canary
 		if canaryWeight >= maxWeight {
@@ -507,6 +570,9 @@ func (c *Controller) checkCanaryStatus(cd *flaggerv1.Canary, shouldAdvance bool)
 	}
 
 	if shouldAdvance {
+		CtrlCounter[fmt.Sprintf("%s.%s", cd.Name, cd.Namespace)] = 0
+		GlobalCtrlCounter[fmt.Sprintf("%s.%s", cd.Name, cd.Namespace)] = 0
+
 		c.recordEventInfof(cd, "New revision detected! Scaling up %s.%s", cd.Spec.TargetRef.Name, cd.Namespace)
 		c.sendNotification(cd, "New revision detected, starting canary analysis.",
 			true, false)
